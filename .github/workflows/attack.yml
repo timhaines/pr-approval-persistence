@@ -61,8 +61,8 @@ jobs:
 
             const ready = await look('AFTER-STATUS');
 
-            // 3. Attempt the merge.
-            try {
-              const m = await github.rest.pulls.merge({owner, repo, pull_number: pr, merge_method: 'squash'});
-              core.info(`MERGE ok merged=${m.data.merged} sha=${m.data.sha}`);
-            } catch (e) { core.info(`MERGE failed ${e.status} ${e.message}`); }
+            // 3. Do NOT merge. Read the merge state instead: BLOCKED -> CLEAN is the
+            //    decisive transition, and it answers the question without landing a commit.
+            core.info(`RESULT approval_survived_push=${after.reviewDecision === 'APPROVED'} ` +
+                      `merge_state_before=${before.mergeStateStatus} merge_state_after=${ready.mergeStateStatus} ` +
+                      `mergeable=${ready.mergeable}`);
